@@ -9,12 +9,17 @@ import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -56,6 +61,12 @@ spreadsheet = gc.open("KPI_Plans")
 
 records_sheet = spreadsheet.worksheet("Records")
 users_sheet = spreadsheet.worksheet("Users")
+admins_sheet = spreadsheet.worksheet("Admins")
+
+# ========================
+# RUNTIME MEMORY
+# ========================
+SHOWN_HELP_USERS = set()
 
 # ========================
 # HELPERS
@@ -89,22 +100,27 @@ def pretty_ddmm(d):
     return datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m")
 
 # ========================
+# ROLES
+# ========================
+def is_admin(user_id: int) -> bool:
+    admins = admins_sheet.get_all_records()
+    for a in admins:
+        if int(a.get("User ID", 0)) == user_id:
+            return True
+    return False
+
+# ========================
 # MESSAGES
 # ========================
 FRIENDLY = {
     "no_plan": [
         "☀️ Доброе утро\nУпс… не вижу план на сегодня 👀",
-        "🌤️ План на сегодня пока прячется",
     ],
     "no_fact": [
         "👀 Кажется забыли факт за прошлый рабочий день",
-        "🧾 Факт за прошлый рабочий день ещё не записан",
     ],
     "no_both": [
         "☀️ Доброе утро\nНе вижу ни плана ни факта 👀",
-    ],
-    "vacation_no_fact": [
-        "🏖️ Хорошего отдыха\nНо факт за прошлый рабочий день всё ещё нужен",
     ],
 }
 
@@ -112,12 +128,32 @@ OFFICIAL = {
     "no_plan": ["План на сегодня отсутствует"],
     "no_fact": ["Факт за прошлый рабочий день не зафиксирован"],
     "no_both": ["Отсутствует план и факт"],
-    "vacation_no_fact": ["Факт за прошлый рабочий день не зафиксирован"],
 }
 
 def pick_message(case):
     src = FRIENDLY if BOT_MODE == "friendly" else OFFICIAL
     return random.choice(src[case])
+
+PUBLIC_HELP_TEXT = (
+    "👋 Привет!\n\n"
+    "Я рабочий бот для планов и фактов.\n\n"
+    "📌 Как пользоваться:\n"
+    "• /plan — написать план (в рабочем чате)\n"
+    "• /fact — написать факт (в рабочем чате)\n"
+    "• /vacation — уйти / выйти из отпуска\n\n"
+    "⏰ Напоминания приходят автоматически в 10:45\n"
+    "📅 В выходные не беспокою\n"
+)
+
+ADMIN_WELCOME_TEXT = (
+    "👋 Привет!\n"
+    "Это **админ-версия бота**.\n\n"
+    "Доступные функции:\n"
+    "• отчёты по командам\n"
+    "• контроль планов и фактов\n"
+    "• управление отпусками\n\n"
+    "Выбери действие 👇"
+)
 
 # ========================
 # RECORD HELPERS
@@ -141,7 +177,7 @@ def in_vacation_today(records, user_id):
     return bool(r and str(r.get("Vacation", "")).lower() == "vacation")
 
 # ========================
-# THREAD CATCHER
+# THREAD / CHAT CATCHER
 # ========================
 async def catch_thread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -161,7 +197,7 @@ async def catch_thread(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 # ========================
-# /PLAN
+# COMMANDS: PLAN / FACT
 # ========================
 async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -187,9 +223,6 @@ async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.set_message_reaction(chat.id, msg.message_id, "👍")
 
-# ========================
-# /FACT
-# ========================
 async def fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
@@ -221,16 +254,15 @@ async def fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.set_message_reaction(chat.id, msg.message_id, "👍")
 
 # ========================
-# /VACATION
+# VACATION
 # ========================
 async def vacation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
     kb = [
         [InlineKeyboardButton("🌴 Уйти в отпуск", callback_data="vac_on")],
         [InlineKeyboardButton("🧑‍💼 Выйти из отпуска", callback_data="vac_off")],
     ]
-    await msg.reply_text(
-        "Статус отпуска",
+    await update.effective_message.reply_text(
+        "Статус отпуска:",
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
@@ -272,6 +304,7 @@ async def reminder_loop(app):
                         uid = int(u.get("User ID", 0))
                         if not uid:
                             continue
+
                         if not str(u.get("Active", "")).lower() in ("true", "1", "yes"):
                             continue
 
@@ -288,12 +321,8 @@ async def reminder_loop(app):
                         if plan_ok and fact_ok:
                             continue
 
-                        if not plan_ok and not fact_ok:
-                            case = "no_both"
-                        elif not plan_ok:
-                            case = "no_plan"
-                        else:
-                            case = "no_fact"
+                        case = "no_both" if not plan_ok and not fact_ok else \
+                               "no_plan" if not plan_ok else "no_fact"
 
                         lines = [pick_message(case)]
                         if not fact_ok:
@@ -313,22 +342,44 @@ async def reminder_loop(app):
             await asyncio.sleep(30)
 
 # ========================
-# HELP / PRIVATE MODE
+# START / PRIVATE MODE
 # ========================
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Привет 👋\n"
-        "Я бот для планов и фактов\n\n"
-        "Команды:\n"
-        "• /plan — план на день (в рабочем чате)\n"
-        "• /fact — факт за день (в рабочем чате)\n"
-        "• /vacation — отпуск\n\n"
-        "Напоминания приходят автоматически"
-    )
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if not (chat and user):
+        return
+
+    if chat.type != "private":
+        await update.effective_message.reply_text(PUBLIC_HELP_TEXT)
+        return
+
+    if is_admin(user.id):
+        await update.effective_message.reply_text(
+            ADMIN_WELCOME_TEXT
+        )
+    else:
+        await update.effective_message.reply_text(PUBLIC_HELP_TEXT)
+        SHOWN_HELP_USERS.add(user.id)
 
 async def private_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await help_cmd(update, context)
+    chat = update.effective_chat
+    user = update.effective_user
+    if not (chat and user):
+        return
+
+    if chat.type != "private":
+        return
+
+    if is_admin(user.id):
+        await update.effective_message.reply_text("Выбери действие 👇")
+        return
+
+    if user.id in SHOWN_HELP_USERS:
+        return
+
+    await update.effective_message.reply_text(PUBLIC_HELP_TEXT)
+    SHOWN_HELP_USERS.add(user.id)
 
 # ========================
 # START
@@ -339,9 +390,11 @@ async def post_init(app):
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("plan", plan))
     app.add_handler(CommandHandler("fact", fact))
     app.add_handler(CommandHandler("vacation", vacation))
+    app.add_handler(CallbackQueryHandler(vacation_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_thread))
     app.add_handler(MessageHandler(filters.TEXT, private_fallback), group=100)
 
