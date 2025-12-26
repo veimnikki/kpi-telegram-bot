@@ -367,6 +367,24 @@ def chat_label(chats_rows: List[Dict[str, str]], chat_id: int, thread_id: int) -
         base = f"{base} — {team}"
     return base
 
+def thread_display_name(chats_rows: List[Dict[str, str]], chat_id: int, thread_id: int) -> str:
+    """
+    Human-readable thread button label:
+    - uses Chats.Thread name if filled
+    - fallback to "thread <id>"
+    """
+    if int(thread_id) == 0:
+        return "Чат (без веток)"
+
+    tname = ""
+    for r in chats_rows:
+        if safe_int(r.get("Chat ID")) == int(chat_id) and normalize_thread_id(r.get("Thread ID")) == int(thread_id):
+            tname = str(r.get("Thread name", "")).strip()
+            break
+
+    return tname if tname else f"thread {int(thread_id)}"
+
+
 # ✅ CHANGE #2 helper: chat-level label (without thread)
 def chat_label_chat_only(chats_rows: List[Dict[str, str]], chat_id: int) -> str:
     chat_name = ""
@@ -1075,6 +1093,64 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
 
         await q.answer("Готово ✅")
+        return
+
+    # MODE TEAM FROM "ALL THREADS" -> PICK THREAD
+    if data.startswith("admin:mode_team_pickchat:"):
+        try:
+            _, _, cid_s = data.split(":", 2)
+            cid = safe_int(cid_s)
+        except Exception:
+            await q.answer("Bad data")
+            return
+
+        if not admin_scope_allows_chat(user.id, cid):
+            await q.answer("Нет доступа")
+            return
+
+        _, chats_rows = safe_table(chats_sheet)
+        tids = chat_threads_for_chat(chats_rows, cid)
+        if not tids:
+            tids = [0]
+
+        buttons = []
+        for tid in tids[:25]:
+            tlabel = thread_display_name(chats_rows, cid, tid)
+            buttons.append([InlineKeyboardButton(f"🧵 {tlabel}", callback_data=f"admin:mode_team:{cid}:{tid}")])
+
+        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:thread_all:{cid}")])
+        await q.message.reply_text("Выбери ветку для изменения Mode команды:",
+                                   reply_markup=InlineKeyboardMarkup(buttons))
+        await q.answer()
+        return
+
+    # MODE USER FROM "ALL THREADS" -> PICK THREAD
+    if data.startswith("admin:mode_user_pickchat:"):
+        try:
+            _, _, cid_s = data.split(":", 2)
+            cid = safe_int(cid_s)
+        except Exception:
+            await q.answer("Bad data")
+            return
+
+        if not admin_scope_allows_chat(user.id, cid):
+            await q.answer("Нет доступа")
+            return
+
+        _, chats_rows = safe_table(chats_sheet)
+        tids = chat_threads_for_chat(chats_rows, cid)
+        if not tids:
+            tids = [0]
+
+        buttons = []
+        for tid in tids[:25]:
+            tlabel = thread_display_name(chats_rows, cid, tid)
+            buttons.append([InlineKeyboardButton(f"🧵 {tlabel}", callback_data=f"admin:mode_user_pick:{cid}:{tid}")])
+
+        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:thread_all:{cid}")])
+        await q.message.reply_text("Выбери ветку для изменения Mode сотрудника:",
+                                   reply_markup=InlineKeyboardMarkup(buttons))
+        await q.answer()
         return
 
     # MODE TEAM MENU
