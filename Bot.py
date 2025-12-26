@@ -163,13 +163,10 @@ def safe_table(ws) -> Tuple[List[str], List[Dict[str, str]]]:
                 val = r[i]
             else:
                 val = ""
-            # store even empty header under special key? no.
             if key and key.strip():
-                # if duplicated header, keep first, ignore next
                 k = key.strip()
                 if k not in row:
                     row[k] = val
-            # ignore empty header columns in dict form
         rows.append(row)
     return headers, rows
 
@@ -186,7 +183,7 @@ def append_row(ws, row_values: List[Any]):
     ws.append_row([("" if v is None else v) for v in row_values])
 
 # =========================================================
-# REQUIRED COLUMNS VALIDATION (SO YOU SEE WHAT'S WRONG FAST)
+# REQUIRED COLUMNS VALIDATION
 # =========================================================
 USERS_REQUIRED = [
     "User ID", "Username", "Name",
@@ -199,7 +196,8 @@ CHATS_REQUIRED = [
     "Thread ID", "Thread name",
     "Team", "Active"
 ]
-ADMINS_REQUIRED = ["Admin user ID", "Username", "Chat ID", "Thread ID"]
+# ✅ CHANGE #1: Admins no longer requires Thread ID
+ADMINS_REQUIRED = ["Admin user ID", "Username", "Chat ID"]
 RECORDS_REQUIRED = [
     "Date",
     "Chat ID", "Chat name",
@@ -277,6 +275,7 @@ SHOWN_HELP_PRIVATE = set()
 
 # =========================================================
 # ADMIN ACCESS (Admins sheet)
+# ✅ CHANGE #1: scope by chat only (no thread)
 # =========================================================
 def admin_rows() -> List[Dict[str, str]]:
     _, rows = safe_table(admins_sheet)
@@ -290,19 +289,24 @@ def is_admin_user(user_id: int) -> bool:
 
 def admin_scopes(user_id: int):
     """
-    returns list of (chat_id, thread_id) allowed for this admin.
-    if admin has empty chat_id => 'ALL'
+    Returns list of chat_id allowed for this admin.
+    If admin has empty chat_id => 'ALL'
     """
-    scopes = []
+    scopes: List[int] = []
     for r in admin_rows():
         if safe_int(r.get("Admin user ID")) != int(user_id):
             continue
         cid = safe_int(r.get("Chat ID"), default=0)
-        tid = normalize_thread_id(r.get("Thread ID"))
         if cid == 0:
             return ["ALL"]
-        scopes.append((cid, tid))
-    return scopes
+        scopes.append(cid)
+    # unique stable
+    out, seen = [], set()
+    for cid in scopes:
+        if cid and cid not in seen:
+            out.append(cid)
+            seen.add(cid)
+    return out
 
 def admin_main_keyboard():
     return InlineKeyboardMarkup([
@@ -324,7 +328,6 @@ def upsert_chat(chat, thread_id: int):
 
     for idx, r in enumerate(rows, start=2):
         if safe_int(r.get("Chat ID")) == int(chat.id) and normalize_thread_id(r.get("Thread ID")) == int(thread_id):
-            # update Chat name; do not touch Thread name/team/active
             update_cell(chats_sheet, idx, hm["Chat name"], chat.title or "")
             return
 
@@ -364,10 +367,51 @@ def chat_label(chats_rows: List[Dict[str, str]], chat_id: int, thread_id: int) -
         base = f"{base} — {team}"
     return base
 
+# ✅ CHANGE #2 helper: chat-level label (without thread)
+def chat_label_chat_only(chats_rows: List[Dict[str, str]], chat_id: int) -> str:
+    chat_name = ""
+    teams = set()
+    has_threads = False
+
+    for r in chats_rows:
+        if safe_int(r.get("Chat ID")) != int(chat_id):
+            continue
+        if not chat_name:
+            chat_name = str(r.get("Chat name", "")).strip()
+        t = str(r.get("Team", "")).strip()
+        if t:
+            teams.add(t)
+        if normalize_thread_id(r.get("Thread ID")) != 0:
+            has_threads = True
+
+    base = chat_name or str(chat_id)
+    if teams:
+        if len(teams) == 1:
+            base = f"{base} — {list(teams)[0]}"
+        else:
+            base = f"{base} — multi-team"
+    if has_threads:
+        base = f"{base} (threads)"
+    return base
+
+def chat_has_threads(chats_rows: List[Dict[str, str]], chat_id: int) -> bool:
+    for r in chats_rows:
+        if safe_int(r.get("Chat ID")) == int(chat_id) and normalize_thread_id(r.get("Thread ID")) != 0:
+            return True
+    return False
+
+def chat_threads_for_chat(chats_rows: List[Dict[str, str]], chat_id: int) -> List[int]:
+    tids = set()
+    for r in chats_rows:
+        if safe_int(r.get("Chat ID")) != int(chat_id):
+            continue
+        tid = normalize_thread_id(r.get("Thread ID"))
+        if tid != 0:
+            tids.add(tid)
+    return sorted(tids)
+
 # =========================================================
 # USERS (ONLY on /plan)
-# Users headers:
-# User ID | Username | Name | Chat ID | Chat name | Thread ID | Thread name | Team | Active | Mode
 # =========================================================
 def upsert_user_binding(user, chat, thread_id: int):
     if not user or not chat:
@@ -389,18 +433,15 @@ def upsert_user_binding(user, chat, thread_id: int):
             and safe_int(r.get("Chat ID")) == cid
             and normalize_thread_id(r.get("Thread ID")) == tid
         ):
-            # update identity + chat name (because chat can be renamed)
             update_cell(users_sheet, idx, hm["Username"], username)
             update_cell(users_sheet, idx, hm["Name"], name)
             update_cell(users_sheet, idx, hm["Chat name"], chat.title or "")
-            # defaults if empty
             if not str(r.get("Active", "")).strip():
                 update_cell(users_sheet, idx, hm["Active"], "TRUE")
             if not str(r.get("Mode", "")).strip():
                 update_cell(users_sheet, idx, hm["Mode"], DEFAULT_BOT_MODE)
             return
 
-    # new row
     append_row(users_sheet, [
         uid,
         username,
@@ -428,9 +469,6 @@ def resolve_user_mode(users_rows: List[Dict[str, str]], user_id: int, chat_id: i
 
 # =========================================================
 # RECORDS (ONE ROW PER day+chat+thread+user)
-# Records headers recommended:
-# Date | Chat ID | Chat name | Thread ID | Thread name | User ID | Username
-# | Plan | Plan time | Fact | Fact time | Vacation
 # =========================================================
 def find_record_row_idx(date_: str, user_id: int, chat_id: int, thread_id: int) -> Optional[int]:
     _, rows = safe_table(records_sheet)
@@ -447,13 +485,10 @@ def find_record_row_idx(date_: str, user_id: int, chat_id: int, thread_id: int) 
 def ensure_record(date_: str, chat, user, thread_id: int) -> int:
     idx = find_record_row_idx(date_, user.id, chat.id, thread_id)
     if idx:
-        # keep Chat name updated
         hm = headers_map(records_sheet)
         update_cell(records_sheet, idx, hm["Chat name"], chat.title or "")
         return idx
 
-    hm = headers_map(records_sheet)
-    # Create new row for this unique key
     append_row(records_sheet, [
         date_,
         chat.id,
@@ -466,7 +501,6 @@ def ensure_record(date_: str, chat, user, thread_id: int) -> int:
         "", "",          # Fact, Fact time
         "active",        # Vacation
     ])
-    # return last row index
     values = ws_values(records_sheet)
     return len(values)
 
@@ -494,9 +528,6 @@ def in_vacation_today(records_rows, uid, cid, tid) -> bool:
 
 # =========================================================
 # GROUP ACTIVITY CATCHER
-# IMPORTANT:
-# - ONLY Chats is auto-filled
-# - Users appears ONLY when user uses /plan in that thread
 # =========================================================
 async def catch_group_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -526,13 +557,11 @@ async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tid = normalize_thread_id(getattr(msg, "message_thread_id", 0))
 
-    # register chat+thread
     try:
         upsert_chat(chat, tid)
     except Exception as e:
         print("⚠️ upsert_chat in /plan error:", e)
 
-    # activate user binding ONLY HERE
     try:
         upsert_user_binding(user, chat, tid)
     except Exception as e:
@@ -540,7 +569,6 @@ async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⚠️ Не смог записать тебя в Users. Проверь заголовки Users.")
         return
 
-    # records: ensure strict row + update fields
     idx = ensure_record(today_str(), chat, user, tid)
     hm = headers_map(records_sheet)
     update_cell(records_sheet, idx, hm["Plan"], text)
@@ -552,7 +580,7 @@ async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # =========================================================
-# /FACT — writes to last_workday row (same chat+thread+user)
+# /FACT
 # =========================================================
 async def fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -580,7 +608,7 @@ async def fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # =========================================================
-# /VACATION — buttons then callback edits message and updates one row
+# /VACATION
 # =========================================================
 async def vacation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -616,12 +644,10 @@ async def vacation_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_cell(records_sheet, idx, hm["Vacation"], "active")
         text_after = "🧑‍💼 Добро пожаловать обратно в строй! Работа включена ✅"
 
-    # remove buttons by editing the same message
     try:
         await q.message.edit_text(text_after, reply_markup=None)
     except Exception as e:
         print("⚠️ edit_message error:", e)
-        # fallback: send new
         try:
             await q.message.reply_text(text_after)
         except Exception:
@@ -670,48 +696,67 @@ async def private_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =========================================================
 # ADMIN PANEL HELPERS
+# ✅ CHANGE #1: scope checks by chat only
+# ✅ CHANGE #2: first screen shows chats only
 # =========================================================
-def admin_scope_allows(admin_id: int, cid: int, tid: int) -> bool:
+def admin_scope_allows_chat(admin_id: int, cid: int) -> bool:
     scopes = admin_scopes(admin_id)
     if scopes == ["ALL"]:
         return True
-    return (cid, tid) in set(scopes)
+    return cid in set(scopes)
 
-def admin_get_chats_for_admin(admin_id: int) -> List[Tuple[int, int]]:
+def admin_get_chats_for_admin(admin_id: int) -> List[int]:
     _, chats_rows = safe_table(chats_sheet)
     scopes = admin_scopes(admin_id)
 
-    pairs = []
+    cids: List[int] = []
     for r in chats_rows:
         cid = safe_int(r.get("Chat ID"))
-        tid = normalize_thread_id(r.get("Thread ID"))
+        if not cid:
+            continue
         if scopes == ["ALL"]:
-            pairs.append((cid, tid))
+            cids.append(cid)
         else:
-            if (cid, tid) in set(scopes):
-                pairs.append((cid, tid))
+            if cid in set(scopes):
+                cids.append(cid)
 
-    # unique + stable
     seen = set()
     out = []
-    for p in pairs:
-        if p not in seen and p[0] != 0:
-            seen.add(p)
-            out.append(p)
+    for cid in cids:
+        if cid not in seen:
+            seen.add(cid)
+            out.append(cid)
     return out
 
 def build_chat_buttons(admin_id: int) -> InlineKeyboardMarkup:
     _, chats_rows = safe_table(chats_sheet)
-    pairs = admin_get_chats_for_admin(admin_id)
+    chat_ids = admin_get_chats_for_admin(admin_id)
 
     buttons = []
-    for (cid, tid) in pairs[:40]:
-        label = chat_label(chats_rows, cid, tid)
-        buttons.append([InlineKeyboardButton(f"📌 {label}", callback_data=f"admin:chat:{cid}:{tid}")])
+    for cid in chat_ids[:40]:
+        label = chat_label_chat_only(chats_rows, cid)
+        buttons.append([InlineKeyboardButton(f"📌 {label}", callback_data=f"admin:chatpick:{cid}")])
 
     if not buttons:
         buttons = [[InlineKeyboardButton("ℹ️ Нет чатов", callback_data="admin:help")]]
 
+    return InlineKeyboardMarkup(buttons)
+
+def build_thread_buttons_for_chat(admin_id: int, cid: int) -> InlineKeyboardMarkup:
+    _, chats_rows = safe_table(chats_sheet)
+
+    tids = chat_threads_for_chat(chats_rows, cid)
+    buttons: List[List[InlineKeyboardButton]] = []
+
+    # "all threads" button
+    buttons.append([InlineKeyboardButton("📌 Все ветки (общий отчёт)", callback_data=f"admin:thread_all:{cid}")])
+
+    # each thread
+    for tid in tids[:45]:
+        label = chat_label(chats_rows, cid, tid)
+        buttons.append([InlineKeyboardButton(f"🧵 {label}", callback_data=f"admin:thread:{cid}:{tid}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Назад к чатам", callback_data="admin:report")])
     return InlineKeyboardMarkup(buttons)
 
 def team_users_for_thread(cid: int, tid: int) -> List[Dict[str, str]]:
@@ -722,6 +767,25 @@ def team_users_for_thread(cid: int, tid: int) -> List[Dict[str, str]]:
         and normalize_thread_id(u.get("Thread ID")) == tid
         and norm_bool(u.get("Active", "TRUE"))
     ]
+
+def team_users_for_chat_all_threads(cid: int) -> List[Tuple[int, int, Dict[str, str]]]:
+    """
+    Returns list of (tid, uid, user_row) for all threads in chat
+    """
+    _, chats_rows = safe_table(chats_sheet)
+    tids = chat_threads_for_chat(chats_rows, cid)
+
+    # if no explicit threads, treat as tid=0 chat
+    if not tids:
+        tids = [0]
+
+    out: List[Tuple[int, int, Dict[str, str]]] = []
+    for tid in tids:
+        for u in team_users_for_thread(cid, tid):
+            uid = safe_int(u.get("User ID"))
+            if uid:
+                out.append((tid, uid, u))
+    return out
 
 # =========================================================
 # ADMIN CALLBACK
@@ -748,15 +812,41 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return
 
-    # REPORT LIST
+    # REPORT LIST (CHAT ONLY)
     if data == "admin:report":
         kb = build_chat_buttons(user.id)
-        await q.message.reply_text("Выбери чат/ветку для отчёта:", reply_markup=kb)
+        await q.message.reply_text("Выбери чат для отчёта:", reply_markup=kb)
         await q.answer()
         return
 
-    # CHAT REPORT
-    if data.startswith("admin:chat:"):
+    # ✅ CHANGE #2: pick chat -> if has threads -> show thread picker, else go directly to report (tid=0)
+    if data.startswith("admin:chatpick:"):
+        try:
+            _, _, cid_s = data.split(":", 2)
+            cid = safe_int(cid_s)
+        except Exception:
+            await q.answer("Bad data")
+            return
+
+        if not admin_scope_allows_chat(user.id, cid):
+            await q.answer("Нет доступа к этому чату")
+            return
+
+        _, chats_rows = safe_table(chats_sheet)
+
+        if chat_has_threads(chats_rows, cid):
+            kb = build_thread_buttons_for_chat(user.id, cid)
+            await q.message.reply_text("В этом чате есть ветки. Выбери ветку или общий отчёт:", reply_markup=kb)
+            await q.answer()
+            return
+
+        # no threads -> direct report for tid=0
+        await q.answer()
+        # re-route internally as if clicked thread
+        data = f"admin:thread:{cid}:0"
+
+    # THREAD REPORT (single thread)
+    if data.startswith("admin:thread:"):
         try:
             _, _, cid_s, tid_s = data.split(":", 3)
             cid = safe_int(cid_s)
@@ -765,7 +855,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Bad data")
             return
 
-        if not admin_scope_allows(user.id, cid, tid):
+        if not admin_scope_allows_chat(user.id, cid):
             await q.answer("Нет доступа к этому чату")
             return
 
@@ -825,7 +915,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons = []
 
-        # vacation toggles for up to 10 users (prioritize missing)
         candidates = (missing_plan + missing_fact)
         uniq = []
         seen = set()
@@ -843,9 +932,94 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"🧑‍💼 {name} → работа", callback_data=f"admin:vac_off:{cid}:{tid}:{uid}"),
             ])
 
-        # mode menus
         buttons.append([InlineKeyboardButton("🙂 Mode: изменить для команды", callback_data=f"admin:mode_team:{cid}:{tid}")])
         buttons.append([InlineKeyboardButton("🙂 Mode: изменить для сотрудника", callback_data=f"admin:mode_user_pick:{cid}:{tid}")])
+
+        # back button: if chat has threads -> back to thread picker, else to chats
+        if chat_has_threads(chats_rows, cid):
+            buttons.append([InlineKeyboardButton("⬅️ Назад к веткам", callback_data=f"admin:chatpick:{cid}")])
+        buttons.append([InlineKeyboardButton("⬅️ Назад к чатам", callback_data="admin:report")])
+
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        await q.answer()
+        return
+
+    # ALL THREADS REPORT (chat summary across threads)
+    if data.startswith("admin:thread_all:"):
+        try:
+            _, _, cid_s = data.split(":", 2)
+            cid = safe_int(cid_s)
+        except Exception:
+            await q.answer("Bad data")
+            return
+
+        if not admin_scope_allows_chat(user.id, cid):
+            await q.answer("Нет доступа к этому чату")
+            return
+
+        _, chats_rows = safe_table(chats_sheet)
+        _, records_rows = safe_table(records_sheet)
+        lw = last_workday_str()
+
+        tids = chat_threads_for_chat(chats_rows, cid)
+        if not tids:
+            tids = [0]
+
+        # aggregate per thread
+        per_thread_lines = []
+        total_active_non_vac = 0
+        total_vac = 0
+        total_plan_ok = 0
+        total_fact_ok = 0
+
+        for tid in tids:
+            team_users = team_users_for_thread(cid, tid)
+            if not team_users:
+                continue
+
+            vac_count = 0
+            plan_ok = 0
+            fact_ok = 0
+
+            for urow in team_users:
+                uid = safe_int(urow.get("User ID"))
+                if in_vacation_today(records_rows, uid, cid, tid):
+                    vac_count += 1
+                    continue
+                if has_plan_today(records_rows, uid, cid, tid):
+                    plan_ok += 1
+                if has_fact_last_workday(records_rows, uid, cid, tid):
+                    fact_ok += 1
+
+            active_non_vac = max(len(team_users) - vac_count, 0)
+
+            total_active_non_vac += active_non_vac
+            total_vac += vac_count
+            total_plan_ok += plan_ok
+            total_fact_ok += fact_ok
+
+            label = chat_label(chats_rows, cid, tid)
+            per_thread_lines.append(
+                f"• {label}: план *{plan_ok}/{active_non_vac}*, факт *{fact_ok}/{active_non_vac}*, отпуск *{vac_count}*"
+            )
+
+        title_chat = chat_label_chat_only(chats_rows, cid)
+        text = (
+            f"📊 Отчет (все ветки): *{title_chat}*\n"
+            f"Дата/время: *{today_str()} {now_time_str()}*\n\n"
+            f"👥 Активных (без отпуска): *{total_active_non_vac}*\n"
+            f"🏖 В отпуске сегодня: *{total_vac}*\n\n"
+            f"✅ План есть: *{total_plan_ok}/{total_active_non_vac}*\n"
+            f"✅ Факт есть (за {pretty_ddmm(lw)}): *{total_fact_ok}/{total_active_non_vac}*\n\n"
+            f"*Разбивка по веткам:*\n" + ("\n".join(per_thread_lines) if per_thread_lines else "—")
+        )
+
+        buttons: List[List[InlineKeyboardButton]] = []
+        # quick navigation to each thread report
+        for tid in tids[:10]:
+            label = f"🧵 Ветка {tid}" if tid != 0 else "💬 Чат (без веток)"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"admin:thread:{cid}:{tid}")])
+        buttons.append([InlineKeyboardButton("⬅️ Назад к веткам", callback_data=f"admin:chatpick:{cid}")])
         buttons.append([InlineKeyboardButton("⬅️ Назад к чатам", callback_data="admin:report")])
 
         await q.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
@@ -860,21 +1034,18 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = safe_int(parts[3])
         uid = safe_int(parts[4])
 
-        if not admin_scope_allows(user.id, cid, tid):
+        if not admin_scope_allows_chat(user.id, cid):
             await q.answer("Нет доступа")
             return
 
         status = "vacation" if action == "vac_on" else "active"
 
-        # Ensure today's record exists for that user in that chat/thread
-        # We need a "fake" user object? We'll update by row index directly.
         idx = find_record_row_idx(today_str(), uid, cid, tid)
 
         hm = headers_map(records_sheet)
         if idx:
             update_cell(records_sheet, idx, hm["Vacation"], status)
         else:
-            # Need chat name and username for row
             _, chats_rows = safe_table(chats_sheet)
             _, users_rows = safe_table(users_sheet)
 
@@ -912,14 +1083,14 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cid = safe_int(cid_s)
         tid = safe_int(tid_s)
 
-        if not admin_scope_allows(user.id, cid, tid):
+        if not admin_scope_allows_chat(user.id, cid):
             await q.answer("Нет доступа")
             return
 
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🙂 friendly (для команды)", callback_data=f"admin:set_mode_team:{cid}:{tid}:friendly")],
             [InlineKeyboardButton("📎 official (для команды)", callback_data=f"admin:set_mode_team:{cid}:{tid}:official")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:chat:{cid}:{tid}")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:thread:{cid}:{tid}")],
         ])
         await q.message.reply_text("Выбери Mode для *всей команды*:", reply_markup=kb, parse_mode="Markdown")
         await q.answer()
@@ -935,7 +1106,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Некорректный Mode")
             return
 
-        if not admin_scope_allows(user.id, cid, tid):
+        if not admin_scope_allows_chat(user.id, cid):
             await q.answer("Нет доступа")
             return
 
@@ -957,7 +1128,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cid = safe_int(cid_s)
         tid = safe_int(tid_s)
 
-        if not admin_scope_allows(user.id, cid, tid):
+        if not admin_scope_allows_chat(user.id, cid):
             await q.answer("Нет доступа")
             return
 
@@ -973,7 +1144,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = (urow.get("Name") or urow.get("Username") or str(uid)).strip()
             buttons.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"admin:mode_user:{cid}:{tid}:{uid}")])
 
-        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:chat:{cid}:{tid}")])
+        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:thread:{cid}:{tid}")])
         await q.message.reply_text("Выбери сотрудника:", reply_markup=InlineKeyboardMarkup(buttons))
         await q.answer()
         return
@@ -984,7 +1155,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = safe_int(tid_s)
         uid = safe_int(uid_s)
 
-        if not admin_scope_allows(user.id, cid, tid):
+        if not admin_scope_allows_chat(user.id, cid):
             await q.answer("Нет доступа")
             return
 
@@ -1008,7 +1179,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Некорректный Mode")
             return
 
-        if not admin_scope_allows(user.id, cid, tid):
+        if not admin_scope_allows_chat(user.id, cid):
             await q.answer("Нет доступа")
             return
 
@@ -1032,13 +1203,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =========================================================
 # REMINDERS LOOP
-# - window 10:44–10:46
-# - Mon checks fact for Friday via last_workday_str()
-# - respects:
-#   Chats.Active per (chat_id, thread_id)
-#   Users.Active per (user_id, chat_id, thread_id)
-#   Records.Vacation == vacation for today
-#   Users.Mode
 # =========================================================
 def in_reminder_window(n: datetime) -> bool:
     if n.hour != REMINDER_HOUR:
@@ -1079,11 +1243,9 @@ async def reminder_loop(app):
                         if not cid:
                             continue
 
-                        # chat/thread inactive?
                         if not chat_is_active(chats_rows, cid, tid):
                             continue
 
-                        # vacation today?
                         if in_vacation_today(records_rows, uid, cid, tid):
                             continue
 
@@ -1139,22 +1301,18 @@ def main():
         .build()
     )
 
-    # SERVICE: fill Chats for any group activity
     app.add_handler(
         MessageHandler(filters.ALL & ~filters.ChatType.PRIVATE, catch_group_activity),
         group=0
     )
 
-    # COMMANDS (work chats)
     app.add_handler(CommandHandler("plan", plan), group=1)
     app.add_handler(CommandHandler("fact", fact), group=1)
     app.add_handler(CommandHandler("vacation", vacation), group=1)
 
-    # CALLBACKS
     app.add_handler(CallbackQueryHandler(vacation_cb, pattern=r"^vac:(on|off)$"))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^admin:"))
 
-    # PRIVATE
     app.add_handler(CommandHandler("start", start_cmd), group=90)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE, private_entry), group=100)
 
