@@ -346,27 +346,6 @@ def chat_is_active(chats_rows: List[Dict[str, str]], chat_id: int, thread_id: in
             return norm_bool(r.get("Active", "TRUE"))
     return True
 
-def chat_label(chats_rows: List[Dict[str, str]], chat_id: int, thread_id: int) -> str:
-    chat_name = ""
-    thread_name = ""
-    team = ""
-
-    for r in chats_rows:
-        if safe_int(r.get("Chat ID")) == int(chat_id) and normalize_thread_id(r.get("Thread ID")) == int(thread_id):
-            chat_name = str(r.get("Chat name", "")).strip()
-            thread_name = str(r.get("Thread name", "")).strip()
-            team = str(r.get("Team", "")).strip()
-            break
-
-    base = chat_name or str(chat_id)
-    if thread_id:
-        base = f"{base} / thread {thread_id}"
-        if thread_name:
-            base = f"{base} — {thread_name}"
-    if team:
-        base = f"{base} — {team}"
-    return base
-
 def thread_display_name(chats_rows: List[Dict[str, str]], chat_id: int, thread_id: int) -> str:
     """
     Human-readable thread button label:
@@ -384,6 +363,23 @@ def thread_display_name(chats_rows: List[Dict[str, str]], chat_id: int, thread_i
 
     return tname if tname else f"thread {int(thread_id)}"
 
+# ✅ CHANGE #1: labels everywhere should show Thread name (not just id)
+def chat_label(chats_rows: List[Dict[str, str]], chat_id: int, thread_id: int) -> str:
+    chat_name = ""
+    team = ""
+
+    for r in chats_rows:
+        if safe_int(r.get("Chat ID")) == int(chat_id) and normalize_thread_id(r.get("Thread ID")) == int(thread_id):
+            chat_name = str(r.get("Chat name", "")).strip()
+            team = str(r.get("Team", "")).strip()
+            break
+
+    base = chat_name or str(chat_id)
+    if thread_id:
+        base = f"{base} / {thread_display_name(chats_rows, chat_id, thread_id)}"
+    if team:
+        base = f"{base} — {team}"
+    return base
 
 # ✅ CHANGE #2 helper: chat-level label (without thread)
 def chat_label_chat_only(chats_rows: List[Dict[str, str]], chat_id: int) -> str:
@@ -714,8 +710,6 @@ async def private_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =========================================================
 # ADMIN PANEL HELPERS
-# ✅ CHANGE #1: scope checks by chat only
-# ✅ CHANGE #2: first screen shows chats only
 # =========================================================
 def admin_scope_allows_chat(admin_id: int, cid: int) -> bool:
     scopes = admin_scopes(admin_id)
@@ -771,8 +765,8 @@ def build_thread_buttons_for_chat(admin_id: int, cid: int) -> InlineKeyboardMark
 
     # each thread
     for tid in tids[:45]:
-        label = chat_label(chats_rows, cid, tid)
-        buttons.append([InlineKeyboardButton(f"🧵 {label}", callback_data=f"admin:thread:{cid}:{tid}")])
+        tlabel = thread_display_name(chats_rows, cid, tid)  # ✅ name instead of id label
+        buttons.append([InlineKeyboardButton(f"🧵 {tlabel}", callback_data=f"admin:thread:{cid}:{tid}")])
 
     buttons.append([InlineKeyboardButton("⬅️ Назад к чатам", callback_data="admin:report")])
     return InlineKeyboardMarkup(buttons)
@@ -785,25 +779,6 @@ def team_users_for_thread(cid: int, tid: int) -> List[Dict[str, str]]:
         and normalize_thread_id(u.get("Thread ID")) == tid
         and norm_bool(u.get("Active", "TRUE"))
     ]
-
-def team_users_for_chat_all_threads(cid: int) -> List[Tuple[int, int, Dict[str, str]]]:
-    """
-    Returns list of (tid, uid, user_row) for all threads in chat
-    """
-    _, chats_rows = safe_table(chats_sheet)
-    tids = chat_threads_for_chat(chats_rows, cid)
-
-    # if no explicit threads, treat as tid=0 chat
-    if not tids:
-        tids = [0]
-
-    out: List[Tuple[int, int, Dict[str, str]]] = []
-    for tid in tids:
-        for u in team_users_for_thread(cid, tid):
-            uid = safe_int(u.get("User ID"))
-            if uid:
-                out.append((tid, uid, u))
-    return out
 
 # =========================================================
 # ADMIN CALLBACK
@@ -837,7 +812,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return
 
-    # ✅ CHANGE #2: pick chat -> if has threads -> show thread picker, else go directly to report (tid=0)
+    # pick chat -> if has threads -> show thread picker, else go directly to report (tid=0)
     if data.startswith("admin:chatpick:"):
         try:
             _, _, cid_s = data.split(":", 2)
@@ -860,8 +835,94 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # no threads -> direct report for tid=0
         await q.answer()
-        # re-route internally as if clicked thread
         data = f"admin:thread:{cid}:0"
+
+    # ✅ RESTORED: ALL THREADS REPORT (chat summary across threads)
+    if data.startswith("admin:thread_all:"):
+        try:
+            _, _, cid_s = data.split(":", 2)
+            cid = safe_int(cid_s)
+        except Exception:
+            await q.answer("Bad data")
+            return
+
+        if not admin_scope_allows_chat(user.id, cid):
+            await q.answer("Нет доступа к этому чату")
+            return
+
+        _, chats_rows = safe_table(chats_sheet)
+        _, records_rows = safe_table(records_sheet)
+        lw = last_workday_str()
+
+        tids = chat_threads_for_chat(chats_rows, cid)
+        if not tids:
+            tids = [0]
+
+        per_thread_lines = []
+        total_active_non_vac = 0
+        total_vac = 0
+        total_plan_ok = 0
+        total_fact_ok = 0
+
+        for tid in tids:
+            team_users = team_users_for_thread(cid, tid)
+            if not team_users:
+                continue
+
+            vac_count = 0
+            plan_ok = 0
+            fact_ok = 0
+
+            for urow in team_users:
+                uid = safe_int(urow.get("User ID"))
+                if in_vacation_today(records_rows, uid, cid, tid):
+                    vac_count += 1
+                    continue
+                if has_plan_today(records_rows, uid, cid, tid):
+                    plan_ok += 1
+                if has_fact_last_workday(records_rows, uid, cid, tid):
+                    fact_ok += 1
+
+            active_non_vac = max(len(team_users) - vac_count, 0)
+
+            total_active_non_vac += active_non_vac
+            total_vac += vac_count
+            total_plan_ok += plan_ok
+            total_fact_ok += fact_ok
+
+            label = chat_label(chats_rows, cid, tid)
+            per_thread_lines.append(
+                f"• {label}: план *{plan_ok}/{active_non_vac}*, факт *{fact_ok}/{active_non_vac}*, отпуск *{vac_count}*"
+            )
+
+        title_chat = chat_label_chat_only(chats_rows, cid)
+        text = (
+            f"📊 Отчет (все ветки): *{title_chat}*\n"
+            f"Дата/время: *{today_str()} {now_time_str()}*\n\n"
+            f"👥 Активных (без отпуска): *{total_active_non_vac}*\n"
+            f"🏖 В отпуске сегодня: *{total_vac}*\n\n"
+            f"✅ План есть: *{total_plan_ok}/{total_active_non_vac}*\n"
+            f"✅ Факт есть (за {pretty_ddmm(lw)}): *{total_fact_ok}/{total_active_non_vac}*\n\n"
+            f"*Разбивка по веткам:*\n" + ("\n".join(per_thread_lines) if per_thread_lines else "—")
+        )
+
+        buttons: List[List[InlineKeyboardButton]] = []
+
+        # quick navigation to each thread report (with proper names)
+        for tid in tids[:10]:
+            tlabel = thread_display_name(chats_rows, cid, tid)
+            buttons.append([InlineKeyboardButton(f"🧵 {tlabel}", callback_data=f"admin:thread:{cid}:{tid}")])
+
+        # these routes exist in your code; they let you pick a thread first
+        buttons.append([InlineKeyboardButton("🙂 Mode (команда) — выбрать ветку", callback_data=f"admin:mode_team_pickchat:{cid}")])
+        buttons.append([InlineKeyboardButton("🙂 Mode (сотрудник) — выбрать ветку", callback_data=f"admin:mode_user_pickchat:{cid}")])
+
+        buttons.append([InlineKeyboardButton("⬅️ Назад к веткам", callback_data=f"admin:chatpick:{cid}")])
+        buttons.append([InlineKeyboardButton("⬅️ Назад к чатам", callback_data="admin:report")])
+
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        await q.answer()
+        return
 
     # THREAD REPORT (single thread)
     if data.startswith("admin:thread:"):
@@ -953,91 +1014,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton("🙂 Mode: изменить для команды", callback_data=f"admin:mode_team:{cid}:{tid}")])
         buttons.append([InlineKeyboardButton("🙂 Mode: изменить для сотрудника", callback_data=f"admin:mode_user_pick:{cid}:{tid}")])
 
-        # back button: if chat has threads -> back to thread picker, else to chats
         if chat_has_threads(chats_rows, cid):
             buttons.append([InlineKeyboardButton("⬅️ Назад к веткам", callback_data=f"admin:chatpick:{cid}")])
-        buttons.append([InlineKeyboardButton("⬅️ Назад к чатам", callback_data="admin:report")])
-
-        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-        await q.answer()
-        return
-
-    # ALL THREADS REPORT (chat summary across threads)
-    if data.startswith("admin:thread_all:"):
-        try:
-            _, _, cid_s = data.split(":", 2)
-            cid = safe_int(cid_s)
-        except Exception:
-            await q.answer("Bad data")
-            return
-
-        if not admin_scope_allows_chat(user.id, cid):
-            await q.answer("Нет доступа к этому чату")
-            return
-
-        _, chats_rows = safe_table(chats_sheet)
-        _, records_rows = safe_table(records_sheet)
-        lw = last_workday_str()
-
-        tids = chat_threads_for_chat(chats_rows, cid)
-        if not tids:
-            tids = [0]
-
-        # aggregate per thread
-        per_thread_lines = []
-        total_active_non_vac = 0
-        total_vac = 0
-        total_plan_ok = 0
-        total_fact_ok = 0
-
-        for tid in tids:
-            team_users = team_users_for_thread(cid, tid)
-            if not team_users:
-                continue
-
-            vac_count = 0
-            plan_ok = 0
-            fact_ok = 0
-
-            for urow in team_users:
-                uid = safe_int(urow.get("User ID"))
-                if in_vacation_today(records_rows, uid, cid, tid):
-                    vac_count += 1
-                    continue
-                if has_plan_today(records_rows, uid, cid, tid):
-                    plan_ok += 1
-                if has_fact_last_workday(records_rows, uid, cid, tid):
-                    fact_ok += 1
-
-            active_non_vac = max(len(team_users) - vac_count, 0)
-
-            total_active_non_vac += active_non_vac
-            total_vac += vac_count
-            total_plan_ok += plan_ok
-            total_fact_ok += fact_ok
-
-            label = chat_label(chats_rows, cid, tid)
-            per_thread_lines.append(
-                f"• {label}: план *{plan_ok}/{active_non_vac}*, факт *{fact_ok}/{active_non_vac}*, отпуск *{vac_count}*"
-            )
-
-        title_chat = chat_label_chat_only(chats_rows, cid)
-        text = (
-            f"📊 Отчет (все ветки): *{title_chat}*\n"
-            f"Дата/время: *{today_str()} {now_time_str()}*\n\n"
-            f"👥 Активных (без отпуска): *{total_active_non_vac}*\n"
-            f"🏖 В отпуске сегодня: *{total_vac}*\n\n"
-            f"✅ План есть: *{total_plan_ok}/{total_active_non_vac}*\n"
-            f"✅ Факт есть (за {pretty_ddmm(lw)}): *{total_fact_ok}/{total_active_non_vac}*\n\n"
-            f"*Разбивка по веткам:*\n" + ("\n".join(per_thread_lines) if per_thread_lines else "—")
-        )
-
-        buttons: List[List[InlineKeyboardButton]] = []
-        # quick navigation to each thread report
-        for tid in tids[:10]:
-            label = f"🧵 Ветка {tid}" if tid != 0 else "💬 Чат (без веток)"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"admin:thread:{cid}:{tid}")])
-        buttons.append([InlineKeyboardButton("⬅️ Назад к веткам", callback_data=f"admin:chatpick:{cid}")])
         buttons.append([InlineKeyboardButton("⬅️ Назад к чатам", callback_data="admin:report")])
 
         await q.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
