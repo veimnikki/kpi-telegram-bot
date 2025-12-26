@@ -204,7 +204,9 @@ RECORDS_REQUIRED = [
     "Thread ID", "Thread name",
     "User ID", "Username",
     "Plan", "Plan time",
-    "Fact", "Fact time",
+    "Fact",
+    "Fact for date",
+    "Fact time",
     "Vacation"
 ]
 
@@ -603,17 +605,33 @@ async def fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or chat.type == "private":
         return
 
-    text = (msg.text or "").replace("/fact", "", 1).strip()
-    if not text:
+    raw = (msg.text or "").replace("/fact", "", 1).strip()
+    if not raw:
+        await msg.reply_text("❗️Факт не может быть пустым")
+        return
+
+    parts = raw.split(maxsplit=1)
+
+    # 👇 определяем за какой день факт
+    if parts[0].lower() == "today":
+        fact_for_date = today_str()
+        text = parts[1] if len(parts) > 1 else ""
+    else:
+        fact_for_date = last_workday_str()
+        text = raw
+
+    if not text.strip():
         await msg.reply_text("❗️Факт не может быть пустым")
         return
 
     tid = normalize_thread_id(getattr(msg, "message_thread_id", 0))
-    d = last_workday_str()
 
-    idx = ensure_record(d, chat, user, tid)
+    # ❗ факт ВСЕГДА пишем в СЕГОДНЯШНЮЮ строку
+    idx = ensure_record(today_str(), chat, user, tid)
     hm = headers_map(records_sheet)
+
     update_cell(records_sheet, idx, hm["Fact"], text)
+    update_cell(records_sheet, idx, hm["Fact for date"], fact_for_date)
     update_cell(records_sheet, idx, hm["Fact time"], now_time_str())
 
     try:
