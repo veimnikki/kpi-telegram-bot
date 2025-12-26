@@ -29,8 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEFAULT_BOT_MODE = os.getenv("BOT_MODE", "friendly").lower().strip()
 
 REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "10"))
-# окно: minute-1 .. minute+1
-REMINDER_MINUTE = int(os.getenv("REMINDER_MINUTE", "45"))
+REMINDER_MINUTE = int(os.getenv("REMINDER_MINUTE", "45"))  # окно: 44..46
 
 tz = pytz.timezone("Europe/Prague")
 
@@ -117,7 +116,6 @@ def norm_bool(x) -> bool:
     return str(x).strip().lower() in ("true", "1", "yes", "y", "да")
 
 def normalize_thread_id(x) -> int:
-    # в таблицах Thread ID может быть "" — считаем это 0
     return safe_int(x, default=0)
 
 def headers_map(ws):
@@ -229,8 +227,6 @@ def upsert_chat(chat, thread_id: int):
     col_chat_id = hm.get("Chat ID", 1)
     col_thread_id = hm.get("Thread ID", 2)
     col_title = hm.get("Chat title", 3)
-    col_team = hm.get("Team", 4)
-    col_active = hm.get("Active", 5)
 
     rows = chats_sheet.get_all_records()
     for idx, r in enumerate(rows, start=2):
@@ -263,7 +259,10 @@ def chat_team_name(chats_records, chat_id: int, thread_id: int) -> str:
 # =========================================================
 # USERS UPSERT (Users sheet)
 # Users: User ID | Username | Full name | Chat ID | Thread ID | Team | Active | Mode
-# One row per (user_id, chat_id, thread_id) — это важно для веток
+# One row per (user_id, chat_id, thread_id)
+#
+# IMPORTANT:
+#   Users добавляем/обновляем ТОЛЬКО при /plan (активация)
 # =========================================================
 def upsert_user_binding(user, chat, thread_id: int):
     if not user or not chat:
@@ -272,14 +271,10 @@ def upsert_user_binding(user, chat, thread_id: int):
     thread_id = int(thread_id or 0)
 
     hm = headers_map(users_sheet)
-    col_uid = hm.get("User ID", 1)
     col_username = hm.get("Username", 2)
     col_fullname = hm.get("Full name", 3)
-    col_chatid = hm.get("Chat ID", 4)
-    col_thread = hm.get("Thread ID", 5)
-    col_team = hm.get("Team", 6)
     col_active = hm.get("Active", 7)
-    col_mode = hm.get("Mode", 8)  # важно: mode в конце
+    col_mode = hm.get("Mode", 8)
 
     rows = users_sheet.get_all_records()
     for idx, r in enumerate(rows, start=2):
@@ -288,9 +283,15 @@ def upsert_user_binding(user, chat, thread_id: int):
             and safe_int(r.get("Chat ID")) == int(chat.id)
             and normalize_thread_id(r.get("Thread ID")) == thread_id
         ):
+            # update identity fields
             users_sheet.update_cell(idx, col_username, user.username or "")
             users_sheet.update_cell(idx, col_fullname, f"{user.first_name or ''} {user.last_name or ''}".strip())
-            # Team не трогаем, Active не трогаем, Mode не трогаем
+            # if Active empty -> TRUE
+            if "Active" in hm and not str(r.get("Active", "")).strip():
+                users_sheet.update_cell(idx, col_active, "TRUE")
+            # if Mode empty -> default
+            if "Mode" in hm and not str(r.get("Mode", "")).strip():
+                users_sheet.update_cell(idx, col_mode, DEFAULT_BOT_MODE)
             return
 
     # new binding row
@@ -306,10 +307,6 @@ def upsert_user_binding(user, chat, thread_id: int):
     ])
 
 def resolve_user_mode(users_records, user_id: int, chat_id: int, thread_id: int) -> str:
-    """
-    Mode берём из Users для конкретной связки (user_id, chat_id, thread_id)
-    Если нет — DEFAULT_BOT_MODE
-    """
     for r in users_records:
         if (
             safe_int(r.get("User ID")) == int(user_id)
@@ -324,7 +321,6 @@ def resolve_user_mode(users_records, user_id: int, chat_id: int, thread_id: int)
 # =========================================================
 # RECORDS HELPERS (Records sheet)
 # Records: Date | Chat ID | Chat title | User ID | Username | Plan | Plan time | Fact | Fact time | Vacation | Thread ID (если есть)
-# We считаем, что "Thread ID" колонка есть. Если нет — код тоже переживёт (будет 0).
 # =========================================================
 def find_record(records, date_, user_id, chat_id, thread_id: int):
     thread_id = int(thread_id or 0)
@@ -347,8 +343,6 @@ def ensure_record_today(chat, user, thread_id: int):
 
     hm = headers_map(records_sheet)
 
-    # Собираем строку по ожидаемому набору.
-    # Если у тебя в Records реально 11 колонок (с Thread ID) — это идеально.
     row = [
         today_str(),
         chat.id,
@@ -382,8 +376,9 @@ def in_vacation_today(records, user_id, chat_id, thread_id):
 
 # =========================================================
 # GROUP ACTIVITY CATCHER
-# - upsert chat (chat+thread)
-# - upsert user binding (user+chat+thread)
+# IMPORTANT:
+#   - Пишем только в Chats (chat+thread)
+#   - Users НЕ трогаем (чтобы не было дублей)
 # =========================================================
 async def catch_group_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -401,13 +396,8 @@ async def catch_group_activity(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         print("⚠️ upsert_chat error:", e)
 
-    try:
-        upsert_user_binding(user, chat, thread_id=thread_id)
-    except Exception as e:
-        print("⚠️ upsert_user_binding error:", e)
-
 # =========================================================
-# /PLAN (GROUP ONLY)
+# /PLAN (GROUP ONLY) — АКТИВАЦИЯ ПОЛЬЗОВАТЕЛЯ В USERS
 # =========================================================
 async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -422,8 +412,21 @@ async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     thread_id = normalize_thread_id(getattr(msg, "message_thread_id", 0))
-    idx = ensure_record_today(chat, user, thread_id=thread_id)
 
+    # 1) Chats register (safety)
+    try:
+        upsert_chat(chat, thread_id=thread_id)
+    except Exception as e:
+        print("⚠️ upsert_chat in /plan error:", e)
+
+    # 2) Users register ONLY HERE (activation)
+    try:
+        upsert_user_binding(user, chat, thread_id=thread_id)
+    except Exception as e:
+        print("⚠️ upsert_user_binding in /plan error:", e)
+
+    # 3) Records write
+    idx = ensure_record_today(chat, user, thread_id=thread_id)
     hm = headers_map(records_sheet)
     records_sheet.update_cell(idx, hm["Plan"], text)
     records_sheet.update_cell(idx, hm["Plan time"], now_time_str())
@@ -473,7 +476,7 @@ async def fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # =========================================================
-# /VACATION (GROUP ONLY)
+# /VACATION (GROUP ONLY) + UX: убрать кнопки и написать фразу
 # =========================================================
 async def vacation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -503,14 +506,26 @@ async def vacation_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hm = headers_map(records_sheet)
     vac_col = hm["Vacation"]
 
-    status = "vacation" if q.data == "vac:on" else "active"
+    if q.data == "vac:on":
+        status = "vacation"
+        text_after = "🌴 Хорошего отдыха! Отпуск включён ✅"
+    else:
+        status = "active"
+        text_after = "🧑‍💼 Добро пожаловать обратно в строй! Работа включена ✅"
+
     records_sheet.update_cell(idx, vac_col, status)
+
+    # убрать кнопки и заменить текст сообщения
+    try:
+        await q.message.edit_text(text_after, reply_markup=None)
+    except Exception as e:
+        # если не получилось редактировать — хотя бы ответим
+        print("⚠️ edit_message error:", e)
+
     await q.answer("Готово ✅")
 
 # =========================================================
 # PRIVATE ENTRY / START
-# - non-admin: show help once then ignore
-# - admin: show admin menu
 # =========================================================
 def admin_main_keyboard():
     return InlineKeyboardMarkup([
@@ -542,7 +557,6 @@ async def private_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if is_admin_user(user.id):
-        # админ-панель: можно отвечать и всегда показывать меню
         await update.effective_message.reply_text(
             ADMIN_WELCOME_TEXT,
             reply_markup=admin_main_keyboard(),
@@ -550,7 +564,6 @@ async def private_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # обычный пользователь: показать один раз и дальше молча игнорировать
     if user.id in SHOWN_HELP_PRIVATE:
         return
     SHOWN_HELP_PRIVATE.add(user.id)
@@ -624,7 +637,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         buttons = []
-        # показываем до 40 кнопок, иначе Телеграм начнёт капризничать
         for r in chats_records[:40]:
             cid = safe_int(r.get("Chat ID"))
             tid = normalize_thread_id(r.get("Thread ID"))
@@ -640,7 +652,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cid = safe_int(cid_s)
         tid = safe_int(tid_s)
 
-        # safety: respect admin scope
         scopes = admin_scopes(user.id)
         if scopes != ["ALL"] and (cid, tid) not in set(scopes):
             await q.answer("Нет доступа к этому чату")
@@ -650,10 +661,9 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chats_records = chats_sheet.get_all_records()
         records = records_sheet.get_all_records()
 
-        # чат должен быть активен, иначе отчёт можно показывать, но напоминания не идут
         chat_active = chat_is_active(chats_records, cid, tid)
 
-        # пользователи этого чата+ветки
+        # IMPORTANT: Users теперь появляются только после /plan
         team_users = [
             u for u in users_records
             if safe_int(u.get("Chat ID")) == cid
@@ -663,8 +673,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not team_users:
             await q.message.reply_text(
-                "Не вижу пользователей с этим Chat ID + Thread ID во вкладке Users.\n"
-                "👉 Нужно, чтобы сотрудники написали *любое* сообщение в этой ветке/чате."
+                "В этой ветке пока нет активированных сотрудников.\n"
+                "👉 Сотрудник появится в Users только после команды /plan в этой ветке."
             )
             await q.answer()
             return
@@ -699,7 +709,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_line = "✅ Активен" if chat_active else "⛔️ Выключен (Active=FALSE в Chats)"
 
         text = (
-            f"📊 Отчет: *{title}*\n"
+            f"📊 Отчет: *{title}* — {today_str()} {now_time_str()}\n"
             f"Статус напоминаний: {status_line}\n"
             f"Дата: *{today_str()}*\n\n"
             f"👥 Активных (без отпуска): *{active_non_vac}*\n"
@@ -710,7 +720,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons = []
 
-        # Vacation toggle for top 8 users (чтобы клавиатура не стала гигантской)
         candidates = (missing_plan + missing_fact)[:8]
         for u in candidates:
             uid = safe_int(u.get("User ID"))
@@ -720,7 +729,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"🧑‍💼 {name} → работа", callback_data=f"admin:vac_off:{cid}:{tid}:{uid}"),
             ])
 
-        # Mode menu
         buttons.append([InlineKeyboardButton("🙂 Mode: изменить для команды", callback_data=f"admin:mode_team:{cid}:{tid}")])
         buttons.append([InlineKeyboardButton("🙂 Mode: изменить для сотрудника", callback_data=f"admin:mode_user_pick:{cid}:{tid}")])
         buttons.append([InlineKeyboardButton("⬅️ Назад к чатам", callback_data="admin:report")])
@@ -729,10 +737,10 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return
 
-    # Toggle vacation
+    # Toggle vacation (admin)
     if data.startswith("admin:vac_on:") or data.startswith("admin:vac_off:"):
         parts = data.split(":")
-        action = parts[1]        # vac_on / vac_off
+        action = parts[1]
         cid = safe_int(parts[2])
         tid = safe_int(parts[3])
         uid = safe_int(parts[4])
@@ -744,9 +752,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         status = "vacation" if action == "vac_on" else "active"
 
-        # find/create today's record for that user in that chat/thread
         records = records_sheet.get_all_records()
-        idx, row = find_record(records, today_str(), uid, cid, tid)
+        idx, _ = find_record(records, today_str(), uid, cid, tid)
 
         hm = headers_map(records_sheet)
         vac_col = hm["Vacation"]
@@ -754,7 +761,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if idx:
             records_sheet.update_cell(idx, vac_col, status)
         else:
-            # create minimal row for today
             chats_records = chats_sheet.get_all_records()
             title = ""
             for r in chats_records:
@@ -762,7 +768,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     title = str(r.get("Chat title", "")).strip()
                     break
 
-            # username from Users
             users_records = users_sheet.get_all_records()
             username = ""
             for u in users_records:
@@ -815,7 +820,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Нет доступа")
             return
 
-        # update all Users rows for this chat/thread
         hm = headers_map(users_sheet)
         col_mode = hm.get("Mode")
         if not col_mode:
@@ -852,7 +856,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
 
         if not team_users:
-            await q.message.reply_text("Сначала пусть сотрудники что-то напишут в этой ветке — чтобы попали в Users.")
+            await q.message.reply_text("Сотрудники появятся здесь только после /plan в этой ветке.")
             await q.answer()
             return
 
@@ -919,19 +923,18 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Готово ✅")
                 return
 
-        await q.answer("Пользователь не найден в Users")
+        await q.answer("Пользователь не найден в Users (нужен /plan в этой ветке)")
         return
 
     await q.answer("Неизвестная команда")
 
 # =========================================================
 # REMINDERS LOOP
-# - окно 10:44–10:46 (если REMINDER_MINUTE=45)
-# - учитываем Chat Active из Chats
-# - учитываем User Active из Users
+# - окно 10:44–10:46
+# - учитываем Chat Active из Chats (по ветке)
+# - учитываем User Active из Users (по ветке)
 # - учитываем Vacation из Records (сегодня)
 # - учитываем Mode из Users
-# - отправляем в chat_id + message_thread_id (если tid != 0)
 # =========================================================
 def in_reminder_window(n: datetime) -> bool:
     if n.hour != REMINDER_HOUR:
@@ -968,7 +971,6 @@ async def reminder_loop(app):
 
                         cid = safe_int(u.get("Chat ID"))
                         tid = normalize_thread_id(u.get("Thread ID"))
-
                         if not cid:
                             continue
 
@@ -999,7 +1001,6 @@ async def reminder_loop(app):
                         if tid:
                             kwargs["message_thread_id"] = tid
 
-                        # сети иногда падают -> ловим, но цикл живёт
                         try:
                             await app.bot.send_message(**kwargs)
                         except Exception as e:
@@ -1018,7 +1019,6 @@ async def post_init(app):
     asyncio.create_task(reminder_loop(app))
 
 def main():
-    # важное: таймауты/сеть. ConnectTimeout бывает из-за сети/хостинга.
     request = HTTPXRequest(
         connect_timeout=20.0,
         read_timeout=20.0,
@@ -1034,13 +1034,13 @@ def main():
         .build()
     )
 
-    # SERVICE: ловим любую активность в группах/ветках, чтобы заполнить Chats/Users
+    # SERVICE: ловим любую активность в группах/ветках, чтобы заполнить Chats (и только Chats)
     app.add_handler(
         MessageHandler(filters.ALL & ~filters.ChatType.PRIVATE, catch_group_activity),
         group=0
     )
 
-    # COMMANDS (work chats only)
+    # COMMANDS
     app.add_handler(CommandHandler("plan", plan), group=1)
     app.add_handler(CommandHandler("fact", fact), group=1)
     app.add_handler(CommandHandler("vacation", vacation), group=1)
