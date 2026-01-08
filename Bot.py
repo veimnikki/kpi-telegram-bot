@@ -553,6 +553,18 @@ def get_record_field(date_: str, user_id: int, chat_id: int, thread_id: int, fie
             return str(r.get(field, "") or "").strip()
     return ""
 
+def user_has_any_fact(uid: int) -> bool:
+    _, rows = safe_table(records_sheet)
+    for r in rows:
+        if safe_int(r.get("User ID")) == uid and str(r.get("Fact", "")).strip():
+            return True
+    return False
+
+
+def has_fact_for_date(date_: str, uid: int, cid: int, tid: int) -> bool:
+    return bool(get_record_field(date_, uid, cid, tid, "Fact"))
+
+
 def has_plan_today(uid, cid, tid) -> bool:
     return bool(get_record_field(today_str(), uid, cid, tid, "Plan"))
 
@@ -619,6 +631,9 @@ async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # /FACT
 # =========================================================
+# =========================================================
+# /FACT — SMART LOGIC (FINAL)
+# =========================================================
 async def fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.effective_message
@@ -632,12 +647,36 @@ async def fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tid = norm_tid(getattr(msg, "message_thread_id", 0))
-    d = last_workday_str()
+    uid = int(user.id)
+    cid = int(chat.id)
 
-    idx = ensure_record(d, chat, user, tid)
+    today = today_str()
+    lw = last_workday_str()
+
+    # 1️⃣ проверяем, был ли у пользователя вообще хоть один факт
+    has_any_fact = user_has_any_fact(uid)
+
+
+    # 2️⃣ решаем, за какой день писать
+    if not has_any_fact:
+        # первый факт в жизни — пишем за сегодня
+        target_date = today
+    else:
+        # если факт за прошлый рабочий день отсутствует — пишем за него
+        if not has_fact_for_date(lw, uid, cid, tid):
+            target_date = lw
+        else:
+            # иначе — за сегодня
+            target_date = today
+
+    # 3️⃣ гарантируем одну строку на день
+    idx = ensure_record(target_date, chat, user, tid)
     hm = headers_map(records_sheet)
-    if "Fact" in hm: update_cell(records_sheet, idx, hm["Fact"], text)
-    if "Fact time" in hm: update_cell(records_sheet, idx, hm["Fact time"], now_time_str())
+
+    if "Fact" in hm:
+        update_cell(records_sheet, idx, hm["Fact"], text)
+    if "Fact time" in hm:
+        update_cell(records_sheet, idx, hm["Fact time"], now_time_str())
 
     try:
         await context.bot.set_message_reaction(chat.id, msg.message_id, "👍")
@@ -1320,8 +1359,6 @@ async def reminder_loop(app):
                         mode = resolve_user_mode(users_rows, uid, cid, tid)
 
                         lines = [pick_message(case, mode)]
-                        if not fact_ok:
-                            lines.append(f"Факт нужен за {pretty_ddmm(lw)}")
                         if not plan_ok:
                             lines.append("План нужен за сегодня")
 
