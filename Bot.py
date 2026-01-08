@@ -765,7 +765,10 @@ def build_thread_buttons_for_chat(admin_id: int, cid: int) -> InlineKeyboardMark
     tids = chat_threads_for_chat(chats_rows, cid)
     buttons: List[List[InlineKeyboardButton]] = []
 
-    buttons.append([InlineKeyboardButton("📌 Все ветки (общий отчёт)", callback_data=f"admin:thread_all:{cid}")])
+    buttons.append([InlineKeyboardButton(
+        "🙂 Mode (команда)",
+        callback_data=f"admin:mode_team:{cid}"
+    )])
 
     for tid in tids[:45]:
         tlabel = thread_display_name(chats_rows, cid, tid)
@@ -921,8 +924,20 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tlabel = thread_display_name(chats_rows, cid, tid)
             buttons.append([InlineKeyboardButton(f"🧵 {tlabel}", callback_data=f"admin:thread:{cid}:{tid}")])
 
-        buttons.append([InlineKeyboardButton("🙂 Mode (команда) — выбрать ветку", callback_data=f"admin:mode_team_pickchat:{cid}")])
-        buttons.append([InlineKeyboardButton("🙂 Mode (сотрудник) — выбрать ветку", callback_data=f"admin:mode_user_pickchat:{cid}")])
+        buttons.append([
+            InlineKeyboardButton(
+                "🙂 Mode (команда)",
+                callback_data=f"admin:mode_team:{cid}"
+            )
+        ])
+
+        buttons.append([
+            InlineKeyboardButton(
+                "🙂 Mode (сотрудник) — выбрать ветку",
+                callback_data=f"admin:mode_user_pickchat:{cid}"
+            )
+        ])
+
         buttons.append([InlineKeyboardButton("⬅️ Назад к веткам", callback_data=f"admin:chatpick:{cid}")])
         buttons.append([InlineKeyboardButton("⬅️ Назад к чатам", callback_data="admin:report")])
 
@@ -1015,8 +1030,12 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"🧑‍💼 {name} → работа", callback_data=f"admin:vac_off:{cid}:{tid}:{uid}"),
             ])
 
-        buttons.append([InlineKeyboardButton("🙂 Mode: изменить для команды", callback_data=f"admin:mode_team:{cid}:{tid}")])
-        buttons.append([InlineKeyboardButton("🙂 Mode: изменить для сотрудника", callback_data=f"admin:mode_user_pick:{cid}:{tid}")])
+        buttons.append([
+            InlineKeyboardButton(
+                "🙂 Mode: изменить для команды",
+                callback_data=f"admin:mode_team:{cid}"
+            )
+        ])
 
         if chat_has_threads(chats_rows, cid):
             buttons.append([InlineKeyboardButton("⬅️ Назад к веткам", callback_data=f"admin:chatpick:{cid}")])
@@ -1081,30 +1100,35 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # MODE TEAM FROM ALL THREADS -> PICK THREAD
-    if data.startswith("admin:mode_team_pickchat:"):
-        try:
-            _, _, cid_s = data.split(":", 2)
-            cid = safe_int(cid_s)
-        except Exception:
-            await q.answer("Bad data")
-            return
+    # MODE TEAM MENU (CHAT-WIDE)
+    if data.startswith("admin:mode_team:"):
+        _, _, cid_s = data.split(":", 2)
+        cid = safe_int(cid_s)
 
         if not admin_scope_allows(user.id, cid, 0):
             await q.answer("Нет доступа")
             return
 
-        _, chats_rows = safe_table(chats_sheet)
-        tids = chat_threads_for_chat(chats_rows, cid) or [0]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🙂 friendly (для всей команды)",
+                callback_data=f"admin:set_mode_team:{cid}:friendly"
+            )],
+            [InlineKeyboardButton(
+                "📎 official (для всей команды)",
+                callback_data=f"admin:set_mode_team:{cid}:official"
+            )],
+            [InlineKeyboardButton(
+                "⬅️ Назад",
+                callback_data=f"admin:thread_all:{cid}"
+            )],
+        ])
 
-        buttons = []
-        for tid in tids[:25]:
-            if not admin_scope_allows(user.id, cid, tid):
-                continue
-            tlabel = thread_display_name(chats_rows, cid, tid)
-            buttons.append([InlineKeyboardButton(f"🧵 {tlabel}", callback_data=f"admin:mode_team:{cid}:{tid}")])
-
-        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:thread_all:{cid}")])
-        await q.message.reply_text("Выбери ветку для изменения Mode команды:", reply_markup=InlineKeyboardMarkup(buttons))
+        await q.message.reply_text(
+            "Выбери Mode для *всей команды этого чата*:",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
         await q.answer()
         return
 
@@ -1137,35 +1161,16 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # MODE TEAM MENU
-    if data.startswith("admin:mode_team:"):
-        _, _, cid_s, tid_s = data.split(":", 3)
-        cid = safe_int(cid_s)
-        tid = safe_int(tid_s)
-
-        if not admin_scope_allows(user.id, cid, tid):
-            await q.answer("Нет доступа")
-            return
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🙂 friendly (для команды)", callback_data=f"admin:set_mode_team:{cid}:{tid}:friendly")],
-            [InlineKeyboardButton("📎 official (для команды)", callback_data=f"admin:set_mode_team:{cid}:{tid}:official")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:thread:{cid}:{tid}")],
-        ])
-        await q.message.reply_text("Выбери Mode для *всей команды*:", reply_markup=kb, parse_mode="Markdown")
-        await q.answer()
-        return
-
     if data.startswith("admin:set_mode_team:"):
-        _, _, cid_s, tid_s, mode = data.split(":", 4)
+        _, _, cid_s, mode = data.split(":", 3)
         cid = safe_int(cid_s)
-        tid = safe_int(tid_s)
-        mode = (mode or "").strip().lower()
+        mode = mode.lower()
 
         if mode not in ("friendly", "official"):
             await q.answer("Некорректный Mode")
             return
 
-        if not admin_scope_allows(user.id, cid, tid):
+        if not admin_scope_allows(user.id, cid, 0):
             await q.answer("Нет доступа")
             return
 
@@ -1174,12 +1179,12 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         changed = 0
         for idx, r in enumerate(rows, start=2):
-            if safe_int(r.get("Chat ID")) == cid and norm_tid(r.get("Thread ID")) == tid:
+            if safe_int(r.get("Chat ID")) == cid:
                 if "Mode" in hm:
                     update_cell(users_sheet, idx, hm["Mode"], mode)
                     changed += 1
 
-        await q.answer(f"Готово ✅ ({changed})")
+        await q.answer(f"Готово ✅ ({changed} сотрудников)")
         return
 
     # MODE USER PICK
