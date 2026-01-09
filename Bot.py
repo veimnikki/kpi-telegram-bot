@@ -207,7 +207,7 @@ RECORDS_REQUIRED = [
     "Date",
     "Chat ID", "Chat name",
     "Thread ID", "Thread name",
-    "User ID", "Username",
+    "User ID", "Username", "Name"
     "Plan", "Plan time",
     "Fact", "Fact time",
     "Vacation"
